@@ -1,0 +1,115 @@
+# Lives in a small PUBLIC repo (pcha07/aster-walks) so GitHub runs it for $0: public repos get unlimited standard
+# runners, including macOS (iPhone simulator) and Linux with KVM (Android emulator). It holds no app code. It checks out the
+# private repo with a read-only token (secret VIBE_READ), builds the staging app, runs the Maestro sim flows and uploads
+# screenshots. Artifacts and logs of a public repo are public: the app is the staging build with fake members only.
+name: Aster simulator walk
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or sha of pcha07/vibe-dating to walk (must contain scripts/walks/sim and the sim flows)
+        default: claude/project-thread-qmzndk-walk5
+        required: true
+      flows:
+        description: Space separated flows
+        default: "sim-1-sign-in-my-page sim-2-edit-your-page sim-3-chat-keyboard"
+      member:
+        default: "D"
+      platforms:
+        description: ios, android or both
+        default: both
+permissions:
+  contents: read
+jobs:
+  ios:
+    if: inputs.platforms != 'android'
+    runs-on: macos-15
+    timeout-minutes: 60
+    env: { FLOWS: "${{ inputs.flows }}", MEMBER: "${{ inputs.member }}" }
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: pcha07/vibe-dating, ref: "${{ inputs.ref }}", token: "${{ secrets.VIBE_READ }}", path: app, persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Install and prebuild
+        working-directory: app
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts
+          npm rebuild @shopify/react-native-skia --foreground-scripts
+          cd apps/mobile
+          node -e 'const e=require("./eas.json").build.staging.env;for(const[k,v]of Object.entries(e))console.log(`${k}=${v}`)' >> "$GITHUB_ENV"
+          npx expo prebuild --platform ios --no-install --clean
+          (cd ios && pod install)
+      - name: Build simulator app (ad-hoc signed, no secrets)
+        working-directory: app/apps/mobile
+        run: |
+          set -euo pipefail
+          WORKSPACE="$(ls -d ios/*.xcworkspace | head -n 1)"; SCHEME="$(basename "$WORKSPACE" .xcworkspace)"
+          xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath ios/build/DerivedData \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="-" build
+          APP="$(find ios/build/DerivedData/Build/Products/Release-iphonesimulator -maxdepth 1 -name '*.app' | head -n 1)"
+          echo "SIM_APP=$PWD/$APP" >> "$GITHUB_ENV"
+      - name: Install Maestro, boot simulator, run flows
+        working-directory: app
+        run: |
+          set -uo pipefail
+          curl -fsSL "https://get.maestro.mobile.dev" | bash
+          export PATH="$HOME/.maestro/bin:$PATH" RUN_ID="$GITHUB_RUN_NUMBER"
+          mkdir -p "$GITHUB_WORKSPACE/walk-out"
+          UDID="$(scripts/walks/sim/boot_ios.sh | tail -n 1)"
+          xcrun simctl install "$UDID" "$SIM_APP"
+          xcrun simctl io "$UDID" recordVideo --codec=h264 "$GITHUB_WORKSPACE/walk-out/ios-walk.mp4" & REC=$!
+          MAESTRO_DEVICE="$UDID" scripts/walks/sim/run_flows.sh ios "$GITHUB_WORKSPACE/walk-out/std-light"; CODE=$?
+          kill -INT "$REC" 2>/dev/null || true; sleep 2
+          exit $CODE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: ios-walk, path: walk-out/** }
+
+  android:
+    if: inputs.platforms != 'ios'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env: { FLOWS: "${{ inputs.flows }}", MEMBER: "${{ inputs.member }}" }
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: pcha07/vibe-dating, ref: "${{ inputs.ref }}", token: "${{ secrets.VIBE_READ }}", path: app, persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - name: Build staging APK (x86_64 for the emulator)
+        working-directory: app
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts
+          npm rebuild @shopify/react-native-skia --foreground-scripts
+          cd apps/mobile
+          node -e 'const e=require("./eas.json").build.staging.env;for(const[k,v]of Object.entries(e))console.log(`${k}=${v}`)' >> "$GITHUB_ENV"
+          npx expo prebuild --platform android --no-install --clean
+          cd android && ./gradlew assembleRelease --no-daemon -PreactNativeArchitectures=x86_64
+          cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/aster.apk"
+      - name: Emulator, Maestro flows
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          profile: pixel_6
+          working-directory: app
+          script: |
+            curl -fsSL "https://get.maestro.mobile.dev" | bash
+            export PATH="$HOME/.maestro/bin:$PATH" RUN_ID="$GITHUB_RUN_NUMBER"
+            adb install -r "$GITHUB_WORKSPACE/aster.apk"
+            mkdir -p "$GITHUB_WORKSPACE/walk-out"
+            scripts/walks/sim/run_flows.sh android "$GITHUB_WORKSPACE/walk-out"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: android-walk, path: walk-out/** }
